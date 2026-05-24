@@ -402,8 +402,17 @@ func runShare(args []string) int {
 		return 1
 	}
 
+	// Content-Type from the file extension. MDX uploads let the server
+	// store the raw .mdx alongside the rendered HTML, which downstream
+	// agents can fetch via GET /p/{id}.mdx instead of paying tokens for
+	// the rendered markup.
+	contentType := "text/html; charset=utf-8"
+	if strings.HasSuffix(strings.ToLower(args[0]), ".mdx") {
+		contentType = "text/mdx; charset=utf-8"
+	}
+
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPut, c.Issuer+"/api/pins", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "text/html; charset=utf-8")
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 	req.Header.Set("X-Agent", agent())
 
@@ -419,11 +428,15 @@ func runShare(args []string) int {
 		return 1
 	}
 	var out struct {
-		URL string `json:"url"`
+		URL    string `json:"url"`
+		MDXURL string `json:"mdx_url"`
 	}
 	if err := json.Unmarshal(rbody, &out); err != nil {
 		fmt.Fprintf(os.Stderr, "pin share: parse: %v\nbody: %s\n", err, rbody)
 		return 1
+	}
+	if out.MDXURL != "" {
+		fmt.Fprintf(os.Stderr, "mdx: %s\n", out.MDXURL)
 	}
 	fmt.Println(out.URL)
 	return 0
