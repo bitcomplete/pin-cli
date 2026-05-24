@@ -1,0 +1,555 @@
+// Command pin is the CLI companion to pin-api: sign in via Google + share
+// HTML files. Designed to be invoked both by humans and by LLM agents
+// running on the human's laptop — `pin share <file>` "just works" once
+// the human has run `pin login` once.
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+)
+
+const (
+	clientID     = "pin-cli"
+	defaultHost  = "https://pin.bitcomplete.dev"
+	envHost      = "PIN_HOST"
+	envAgent     = "PIN_AGENT"
+	tokenLeeway  = 30 * time.Second
+	pollInterval = 2 * time.Second
+)
+
+// Version is overridden at build time via goreleaser's ldflags
+// (`-X main.Version=...`). Stays "dev" for `go install` builds.
+var Version = "dev"
+
+type creds struct {
+	Issuer       string `json:"issuer"`
+	Email        string `json:"email"`
+	RefreshToken string `json:"refresh_token"`
+	AccessToken  string `json:"access_token"`
+	AccessExpAt  int64  `json:"access_token_expires_at"`
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "login":
+		os.Exit(runLogin(os.Args[2:]))
+	case "logout":
+		os.Exit(runLogout(os.Args[2:]))
+	case "share":
+		os.Exit(runShare(os.Args[2:]))
+	case "whoami":
+		os.Exit(runWhoami(os.Args[2:]))
+	case "version", "-v", "--version":
+		fmt.Println(Version)
+	case "-h", "--help", "help":
+		usage()
+	default:
+		fmt.Fprintf(os.Stderr, "pin: unknown command %q\n\n", os.Args[1])
+		usage()
+		os.Exit(2)
+	}
+}
+
+func usage() {
+	fmt.Println(`pin — share HTML files behind Google SSO.
+
+Usage:
+  pin login [--device]   Sign in via Google. Use --device on SSH/headless.
+  pin share <file>       Upload an HTML file. Prints the share URL.
+  pin whoami             Show current logged-in user.
+  pin logout             Revoke the current refresh token + forget local creds.
+  pin version            Print the CLI version.
+
+Environment:
+  PIN_HOST    Override pin's base URL (default https://pin.bitcomplete.dev).
+  PIN_AGENT   Override the actor string sent with auth requests
+              (default: "pin-cli@<hostname>").`)
+}
+
+func host() string {
+	if h := os.Getenv(envHost); h != "" {
+		return strings.TrimRight(h, "/")
+	}
+	return defaultHost
+}
+
+func agent() string {
+	if a := os.Getenv(envAgent); a != "" {
+		return a
+	}
+	hn, _ := os.Hostname()
+	if hn == "" {
+		hn = "unknown"
+	}
+	return "pin-cli@" + hn
+}
+
+// ----- login -----
+
+func runLogin(args []string) int {
+	device := false
+	for _, a := range args {
+		if a == "--device" {
+			device = true
+		}
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	var c *creds
+	var err error
+	if device {
+		c, err = loginDevice(ctx)
+	} else {
+		c, err = loginLoopback(ctx)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin login: %v\n", err)
+		return 1
+	}
+	if err := saveCreds(c); err != nil {
+		fmt.Fprintf(os.Stderr, "pin login: save credentials: %v\n", err)
+		return 1
+	}
+	fmt.Printf("logged in as %s\n", c.Email)
+	return 0
+}
+
+func loginLoopback(ctx context.Context) (*creds, error) {
+	verifier, challenge, err := pkcePair()
+	if err != nil {
+		return nil, err
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("loopback listen: %w", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/", port)
+
+	stateRaw := make([]byte, 16)
+	_, _ = readRandom(stateRaw)
+	state := base64.RawURLEncoding.EncodeToString(stateRaw)
+
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {clientID},
+		"redirect_uri":          {redirectURI},
+		"state":                 {state},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"scope":                 {"share:write"},
+		"actor":                 {agent()},
+	}
+	authURL := host() + "/oauth/authorize?" + q.Encode()
+
+	type result struct {
+		code string
+		err  error
+	}
+	out := make(chan result, 1)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("state") != state {
+			out <- result{err: errors.New("state mismatch")}
+			http.Error(w, "state mismatch", http.StatusBadRequest)
+			return
+		}
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			out <- result{err: errors.New("no code in callback")}
+			http.Error(w, "no code", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte("<h1>pin: signed in</h1><p>You can close this tab.</p>"))
+		out <- result{code: code}
+	})
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Shutdown(context.Background())
+
+	fmt.Printf("Opening browser to %s ...\n", host())
+	_ = openBrowser(authURL)
+	fmt.Println("If the browser didn't open, paste this URL:")
+	fmt.Println("  " + authURL)
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-out:
+		if res.err != nil {
+			return nil, res.err
+		}
+		return exchangeCode(ctx, res.code, verifier, redirectURI)
+	case <-time.After(5 * time.Minute):
+		return nil, errors.New("timed out waiting for browser redirect")
+	}
+}
+
+func loginDevice(ctx context.Context) (*creds, error) {
+	form := url.Values{
+		"client_id": {clientID},
+		"scope":     {"share:write"},
+		"actor":     {agent()},
+	}
+	resp, err := http.PostForm(host()+"/oauth/device_authorization", form)
+	if err != nil {
+		return nil, fmt.Errorf("device_authorization: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("device_authorization http %d: %s", resp.StatusCode, body)
+	}
+	var dr struct {
+		DeviceCode      string `json:"device_code"`
+		UserCode        string `json:"user_code"`
+		VerificationURI string `json:"verification_uri"`
+		Interval        int    `json:"interval"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&dr); err != nil {
+		return nil, err
+	}
+	interval := time.Duration(dr.Interval) * time.Second
+	if interval == 0 {
+		interval = pollInterval
+	}
+	fmt.Printf("Go to %s and enter: %s\nWaiting for approval ...\n", dr.VerificationURI, dr.UserCode)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(interval):
+		}
+		c, err := pollDevice(ctx, dr.DeviceCode)
+		if err == nil {
+			return c, nil
+		}
+		if errors.Is(err, errPending) {
+			continue
+		}
+		return nil, err
+	}
+}
+
+var errPending = errors.New("authorization_pending")
+
+func pollDevice(ctx context.Context, deviceCode string) (*creds, error) {
+	form := url.Values{
+		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
+		"device_code": {deviceCode},
+	}
+	resp, err := http.PostForm(host()+"/oauth/token", form)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == 200 {
+		return tokensFromBody(body)
+	}
+	var oe struct {
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(body, &oe)
+	if oe.Error == "authorization_pending" {
+		return nil, errPending
+	}
+	return nil, fmt.Errorf("token: %s", oe.Error)
+}
+
+func exchangeCode(ctx context.Context, code, verifier, redirectURI string) (*creds, error) {
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"code_verifier": {verifier},
+		"redirect_uri":  {redirectURI},
+		"client_id":     {clientID},
+	}
+	resp, err := http.PostForm(host()+"/oauth/token", form)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("token http %d: %s", resp.StatusCode, body)
+	}
+	return tokensFromBody(body)
+}
+
+func tokensFromBody(body []byte) (*creds, error) {
+	var tr struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &tr); err != nil {
+		return nil, err
+	}
+	email, err := emailFromJWT(tr.AccessToken)
+	if err != nil {
+		return nil, fmt.Errorf("decode access token: %w", err)
+	}
+	return &creds{
+		Issuer:       host(),
+		Email:        email,
+		AccessToken:  tr.AccessToken,
+		RefreshToken: tr.RefreshToken,
+		AccessExpAt:  time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second).Unix(),
+	}, nil
+}
+
+// emailFromJWT cracks the `sub` claim out of a JWT without verifying — we
+// trust the server who just issued it.
+func emailFromJWT(tok string) (string, error) {
+	parts := strings.SplitN(tok, ".", 3)
+	if len(parts) != 3 {
+		return "", errors.New("malformed jwt")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", err
+	}
+	var c struct {
+		Sub string `json:"sub"`
+	}
+	if err := json.Unmarshal(payload, &c); err != nil {
+		return "", err
+	}
+	return c.Sub, nil
+}
+
+// ----- logout -----
+
+func runLogout(_ []string) int {
+	c, err := loadCreds()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin logout: not logged in\n")
+		return 1
+	}
+	form := url.Values{"token": {c.RefreshToken}}
+	_, _ = http.PostForm(c.Issuer+"/oauth/revoke", form) // best-effort
+	if err := deleteCreds(); err != nil {
+		fmt.Fprintf(os.Stderr, "pin logout: %v\n", err)
+		return 1
+	}
+	fmt.Println("logged out")
+	return 0
+}
+
+// ----- whoami -----
+
+func runWhoami(_ []string) int {
+	c, err := loadCreds()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "not logged in")
+		return 1
+	}
+	fmt.Println(c.Email)
+	return 0
+}
+
+// ----- share -----
+
+func runShare(args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: pin share <file>")
+		return 2
+	}
+	body, err := os.ReadFile(args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin share: %v\n", err)
+		return 1
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	c, err := loadCreds()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin share: not logged in. Run `pin login`.\n")
+		return 1
+	}
+	c, err = ensureFreshAccess(ctx, c)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin share: refresh: %v\n", err)
+		return 1
+	}
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPut, c.Issuer+"/api/pins", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "text/html; charset=utf-8")
+	req.Header.Set("Authorization", "Bearer "+c.AccessToken)
+	req.Header.Set("X-Agent", agent())
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin share: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	rbody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		fmt.Fprintf(os.Stderr, "pin share: http %d: %s\n", resp.StatusCode, rbody)
+		return 1
+	}
+	var out struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(rbody, &out); err != nil {
+		fmt.Fprintf(os.Stderr, "pin share: parse: %v\nbody: %s\n", err, rbody)
+		return 1
+	}
+	fmt.Println(out.URL)
+	return 0
+}
+
+// ensureFreshAccess refreshes the access token if it's within the leeway
+// window of expiring.
+func ensureFreshAccess(ctx context.Context, c *creds) (*creds, error) {
+	if time.Now().Unix() < c.AccessExpAt-int64(tokenLeeway.Seconds()) {
+		return c, nil
+	}
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {c.RefreshToken},
+		"client_id":     {clientID},
+	}
+	resp, err := http.PostForm(c.Issuer+"/oauth/token", form)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("refresh http %d: %s", resp.StatusCode, body)
+	}
+	newC, err := tokensFromBody(body)
+	if err != nil {
+		return nil, err
+	}
+	if err := saveCreds(newC); err != nil {
+		return nil, err
+	}
+	return newC, nil
+}
+
+// ----- PKCE + random -----
+
+func pkcePair() (verifier, challenge string, err error) {
+	b := make([]byte, 32)
+	if _, err := readRandom(b); err != nil {
+		return "", "", err
+	}
+	verifier = base64.RawURLEncoding.EncodeToString(b)
+	sum := sha256Sum(verifier)
+	challenge = base64.RawURLEncoding.EncodeToString(sum)
+	return verifier, challenge, nil
+}
+
+// ----- browser open -----
+
+func openBrowser(rawURL string) error {
+	var cmd string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		cmd, args = "open", []string{rawURL}
+	case "windows":
+		cmd, args = "rundll32", []string{"url.dll,FileProtocolHandler", rawURL}
+	default:
+		cmd, args = "xdg-open", []string{rawURL}
+	}
+	return exec.Command(cmd, args...).Start()
+}
+
+// ----- credentials persistence -----
+
+// We prefer OS keychain; fall back to a 0600 file at ~/.config/pin/credentials.json.
+// The keychain key namespaces by issuer so users hopping between dev/prod
+// instances each have their own row.
+
+func credsFilePath() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "pin", "credentials.json"), nil
+}
+
+func saveCreds(c *creds) error {
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := keychainSet(c.Issuer, string(b)); err == nil {
+		// also keep a 0600 file as belt+suspenders for headless reads (CI).
+	}
+	p, err := credsFilePath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(p, b, 0o600)
+}
+
+func loadCreds() (*creds, error) {
+	issuer := host()
+	if raw, err := keychainGet(issuer); err == nil && raw != "" {
+		var c creds
+		if err := json.Unmarshal([]byte(raw), &c); err == nil && c.Email != "" {
+			return &c, nil
+		}
+	}
+	p, err := credsFilePath()
+	if err != nil {
+		return nil, err
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil, err
+	}
+	var c creds
+	if err := json.Unmarshal(b, &c); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func deleteCreds() error {
+	issuer := host()
+	_ = keychainDel(issuer)
+	p, err := credsFilePath()
+	if err != nil {
+		return err
+	}
+	_ = os.Remove(p)
+	return nil
+}

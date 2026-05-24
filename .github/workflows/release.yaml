@@ -1,0 +1,40 @@
+name: release
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      # Org-scoped GitHub App that's allowed to push to homebrew-tap.
+      # Same app + secret as kploy-cli; see bc-prod org settings.
+      - name: Mint Homebrew tap installation token
+        id: tap_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: "182548"
+          private-key: ${{ secrets.HOMEBREW_RELEASER_PRIVATE_KEY }}
+          owner: bitcomplete
+          repositories: homebrew-tap
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ steps.tap_token.outputs.token }}

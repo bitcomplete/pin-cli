@@ -1,0 +1,76 @@
+version: 2
+project_name: pin
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: pin
+    main: .
+    binary: pin
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w -X main.Version={{.Version}}
+
+archives:
+  - id: pin
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE*
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: bitcomplete
+    name: pin-cli
+  prerelease: auto
+
+brews:
+  - name: pin
+    repository:
+      owner: bitcomplete
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/bitcomplete/pin-cli
+    description: Command-line client for pin (HTML sharing service)
+    license: MIT
+    commit_author:
+      name: pin-release-bot
+      email: noreply@bitcomplete.io
+    directory: Formula
+    install: |
+      bin.install "pin"
+    test: |
+      assert_match "pin", shell_output("#{bin}/pin --help")
