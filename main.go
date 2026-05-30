@@ -57,6 +57,8 @@ func main() {
 		os.Exit(runLogout(os.Args[2:]))
 	case "share":
 		os.Exit(runShare(os.Args[2:]))
+	case "get":
+		os.Exit(runGet(os.Args[2:]))
 	case "whoami":
 		os.Exit(runWhoami(os.Args[2:]))
 	case "version", "-v", "--version":
@@ -74,11 +76,13 @@ func usage() {
 	fmt.Println(`pin — share HTML files behind Google SSO.
 
 Usage:
-  pin login [--device]   Sign in via Google. Use --device on SSH/headless.
-  pin share <file>       Upload an HTML file. Prints the share URL.
-  pin whoami             Show current logged-in user.
-  pin logout             Revoke the current refresh token + forget local creds.
-  pin version            Print the CLI version.
+  pin login [--device]      Sign in via Google. Use --device on SSH/headless.
+  pin share <file>          Upload an HTML or MDX file. Prints the share URL.
+  pin get <id-or-url>       Fetch a share's MDX source to stdout. --html for
+                            the rendered HTML form.
+  pin whoami                Show current logged-in user.
+  pin logout                Revoke the current refresh token + forget local creds.
+  pin version               Print the CLI version.
 
 Environment:
   PIN_HOST    Override pin's base URL (default https://pin.bitcomplete.dev).
@@ -440,6 +444,124 @@ func runShare(args []string) int {
 	}
 	fmt.Println(out.URL)
 	return 0
+}
+
+// ----- get -----
+
+// runGet fetches a share by id (or full URL) and writes its contents
+// to stdout. Default to the .mdx representation since that's the
+// agent-cheap form; --html fetches the rendered HTML. Designed to be
+// piped:
+//
+//	pin get 01HX... | claude --some-flag
+//	pin get https://pin.bitcomplete.dev/p/01HX... > /tmp/plan.mdx
+func runGet(args []string) int {
+	wantHTML := false
+	var idArg string
+	for _, a := range args {
+		switch {
+		case a == "--html":
+			wantHTML = true
+		case a == "--mdx":
+			wantHTML = false
+		case strings.HasPrefix(a, "-"):
+			fmt.Fprintf(os.Stderr, "pin get: unknown flag %q\n", a)
+			return 2
+		case idArg == "":
+			idArg = a
+		default:
+			fmt.Fprintln(os.Stderr, "pin get: too many arguments")
+			return 2
+		}
+	}
+	if idArg == "" {
+		fmt.Fprintln(os.Stderr, "usage: pin get <id-or-url> [--html]")
+		return 2
+	}
+
+	id, hostFromURL := parseShareRef(idArg)
+	if id == "" {
+		fmt.Fprintf(os.Stderr, "pin get: not a share id or URL: %q\n", idArg)
+		return 2
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	c, err := loadCreds()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin get: not logged in. Run `pin login`.\n")
+		return 1
+	}
+	c, err = ensureFreshAccess(ctx, c)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin get: refresh: %v\n", err)
+		return 1
+	}
+
+	base := hostFromURL
+	if base == "" {
+		base = host()
+	}
+	path := "/p/" + id
+	if !wantHTML {
+		path += ".mdx"
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+	req.Header.Set("Authorization", "Bearer "+c.AccessToken)
+	req.Header.Set("X-Agent", agent())
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin get: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		// Distinguish "no such share" from "no MDX representation".
+		body, _ := io.ReadAll(resp.Body)
+		if !wantHTML && strings.Contains(string(body), "MDX representation") {
+			fmt.Fprintf(os.Stderr, "pin get: %s was uploaded as HTML; try --html\n", id)
+		} else {
+			fmt.Fprintf(os.Stderr, "pin get: not found: %s\n", id)
+		}
+		return 1
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "pin get: http %d: %s\n", resp.StatusCode, body)
+		return 1
+	}
+	if _, err := io.Copy(os.Stdout, resp.Body); err != nil {
+		fmt.Fprintf(os.Stderr, "pin get: stream: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// parseShareRef accepts a bare ULID, a "p/{id}" path, or a full URL
+// like "https://pin.bitcomplete.dev/p/{id}". Returns (id, host) where
+// host is "" unless a URL was passed (in which case it overrides
+// PIN_HOST so cross-instance fetches work).
+func parseShareRef(ref string) (id string, hostFromURL string) {
+	ref = strings.TrimSpace(ref)
+	// Strip .mdx / .html suffix if user pasted one.
+	for _, suf := range []string{".mdx", ".html"} {
+		ref = strings.TrimSuffix(ref, suf)
+	}
+	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+		u, err := url.Parse(ref)
+		if err != nil || u.Host == "" {
+			return "", ""
+		}
+		hostFromURL = u.Scheme + "://" + u.Host
+		ref = strings.TrimPrefix(u.Path, "/")
+	}
+	ref = strings.TrimPrefix(ref, "p/")
+	if ref == "" || strings.ContainsAny(ref, "/?# ") {
+		return "", ""
+	}
+	return ref, hostFromURL
 }
 
 // ensureFreshAccess refreshes the access token if it's within the leeway
