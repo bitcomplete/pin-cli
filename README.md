@@ -22,7 +22,8 @@ Subcommands:
 | Command | What |
 |---|---|
 | `pin login [--device]` | Sign in. `--device` for SSH / headless boxes. |
-| `pin share <file>` | Upload an HTML file. Prints the share URL. |
+| `pin share <file>` | Upload an HTML or MDX file. Prints the share URL. |
+| `pin get <id-or-url>` | Fetch a share's MDX source to stdout. `--html` for the rendered form. |
 | `pin whoami` | Show the currently-logged-in email. |
 | `pin logout` | Revoke the refresh token + clear local creds. |
 | `pin version` | Print the CLI version. |
