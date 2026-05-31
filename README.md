@@ -24,6 +24,9 @@ Subcommands:
 | `pin login [--device]` | Sign in. `--device` for SSH / headless boxes. |
 | `pin share <file>` | Upload an HTML or MDX file. Prints the share URL. |
 | `pin get <id-or-url>` | Fetch a share's MDX source to stdout. `--html` for the rendered form. |
+| `pin components` | List the MDX components available in pin, grouped by category. |
+| `pin components get <Name>` | Show one component's props + example. |
+| `pin components dump` | Print every component's full detail. |
 | `pin whoami` | Show the currently-logged-in email. |
 | `pin logout` | Revoke the refresh token + clear local creds. |
 | `pin version` | Print the CLI version. |

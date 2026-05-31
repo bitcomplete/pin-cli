@@ -59,6 +59,8 @@ func main() {
 		os.Exit(runShare(os.Args[2:]))
 	case "get":
 		os.Exit(runGet(os.Args[2:]))
+	case "components":
+		os.Exit(runComponents(os.Args[2:]))
 	case "whoami":
 		os.Exit(runWhoami(os.Args[2:]))
 	case "version", "-v", "--version":
@@ -80,6 +82,10 @@ Usage:
   pin share <file>          Upload an HTML or MDX file. Prints the share URL.
   pin get <id-or-url>       Fetch a share's MDX source to stdout. --html for
                             the rendered HTML form.
+  pin components            List MDX components, grouped by category.
+  pin components get <Name> Show one component's props + example.
+  pin components dump       Print every component's full detail.
+                            All three support --json for machine output.
   pin whoami                Show current logged-in user.
   pin logout                Revoke the current refresh token + forget local creds.
   pin version               Print the CLI version.
