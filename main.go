@@ -59,6 +59,10 @@ func main() {
 		os.Exit(runShare(os.Args[2:]))
 	case "get":
 		os.Exit(runGet(os.Args[2:]))
+	case "publish":
+		os.Exit(runPublish(os.Args[2:]))
+	case "unpublish":
+		os.Exit(runUnpublish(os.Args[2:]))
 	case "components":
 		os.Exit(runComponents(os.Args[2:]))
 	case "whoami":
@@ -82,6 +86,10 @@ Usage:
   pin share <file>          Upload an HTML or MDX file. Prints the share URL.
   pin get <id-or-url>       Fetch a share's MDX source to stdout. --html for
                             the rendered HTML form.
+  pin publish <id-or-url>   Make a share publicly viewable (no login) via a
+                            capability link. --ttl <dur> sets the lifetime
+                            (default 7d, max 30d). Prints the public URL.
+  pin unpublish <token|url> Revoke a public link before it expires.
   pin components            List MDX components, grouped by category.
   pin components get <Name> Show one component's props + example.
   pin components dump       Print every component's full detail.
@@ -543,6 +551,171 @@ func runGet(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// ----- publish / unpublish -----
+
+// runPublish flips an existing share public by minting a capability
+// token, then prints a login-free URL. This is the deliberate "safety
+// off" action — invoking it is the conscious step; the server still
+// requires the explicit confirm sentinel we send below.
+func runPublish(args []string) int {
+	var idArg, ttl string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--ttl":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "pin publish: --ttl needs a value, e.g. --ttl 24h")
+				return 2
+			}
+			i++
+			ttl = args[i]
+		case strings.HasPrefix(a, "--ttl="):
+			ttl = strings.TrimPrefix(a, "--ttl=")
+		case strings.HasPrefix(a, "-"):
+			fmt.Fprintf(os.Stderr, "pin publish: unknown flag %q\n", a)
+			return 2
+		case idArg == "":
+			idArg = a
+		default:
+			fmt.Fprintln(os.Stderr, "pin publish: too many arguments")
+			return 2
+		}
+	}
+	if idArg == "" {
+		fmt.Fprintln(os.Stderr, "usage: pin publish <id-or-url> [--ttl 7d]")
+		return 2
+	}
+
+	id, hostFromURL := parseShareRef(idArg)
+	if id == "" {
+		fmt.Fprintf(os.Stderr, "pin publish: not a share id or URL: %q\n", idArg)
+		return 2
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	c, err := loadCreds()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin publish: not logged in. Run `pin login`.\n")
+		return 1
+	}
+	c, err = ensureFreshAccess(ctx, c)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin publish: refresh: %v\n", err)
+		return 1
+	}
+
+	base := hostFromURL
+	if base == "" {
+		base = host()
+	}
+	reqBody := map[string]string{"confirm": "publish-public"}
+	if ttl != "" {
+		reqBody["ttl"] = ttl
+	}
+	body, _ := json.Marshal(reqBody)
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/pins/"+id+"/public", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.AccessToken)
+	req.Header.Set("X-Agent", agent())
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin publish: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	rbody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		fmt.Fprintf(os.Stderr, "pin publish: http %d: %s\n", resp.StatusCode, strings.TrimSpace(string(rbody)))
+		return 1
+	}
+	var out struct {
+		PublicURL string `json:"public_url"`
+		ExpiresAt string `json:"expires_at"`
+		TTLDays   int    `json:"ttl_days"`
+	}
+	if err := json.Unmarshal(rbody, &out); err != nil {
+		fmt.Fprintf(os.Stderr, "pin publish: parse: %v\nbody: %s\n", err, rbody)
+		return 1
+	}
+	// Warn loudly on stderr; the URL itself stays the only thing on stdout
+	// so it's safe to pipe/capture.
+	fmt.Fprintf(os.Stderr, "⚠ public — anyone with this link can view it, no login. Expires %s (%dd). Revoke with `pin unpublish`.\n", out.ExpiresAt, out.TTLDays)
+	fmt.Println(out.PublicURL)
+	return 0
+}
+
+// runUnpublish revokes a public link. Accepts the raw token or the full
+// public URL (from which it lifts the ?token= value).
+func runUnpublish(args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: pin unpublish <token-or-url>")
+		return 2
+	}
+	token, hostFromURL := parsePublicRef(args[0])
+	if token == "" {
+		fmt.Fprintf(os.Stderr, "pin unpublish: no token in %q\n", args[0])
+		return 2
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	c, err := loadCreds()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin unpublish: not logged in. Run `pin login`.\n")
+		return 1
+	}
+	c, err = ensureFreshAccess(ctx, c)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin unpublish: refresh: %v\n", err)
+		return 1
+	}
+
+	base := hostFromURL
+	if base == "" {
+		base = host()
+	}
+	body, _ := json.Marshal(map[string]string{"token": token})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/pins/public/revoke", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.AccessToken)
+	req.Header.Set("X-Agent", agent())
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin unpublish: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		rbody, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "pin unpublish: http %d: %s\n", resp.StatusCode, strings.TrimSpace(string(rbody)))
+		return 1
+	}
+	fmt.Fprintln(os.Stderr, "revoked — the public link no longer works")
+	return 0
+}
+
+// parsePublicRef extracts the capability token from either a bare token
+// or a full public URL like
+// "https://pin.bitcomplete.dev/public/p/{id}?token=…". Returns (token,
+// host) where host is "" unless a URL was passed.
+func parsePublicRef(ref string) (token, hostFromURL string) {
+	ref = strings.TrimSpace(ref)
+	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+		u, err := url.Parse(ref)
+		if err != nil || u.Host == "" {
+			return "", ""
+		}
+		return u.Query().Get("token"), u.Scheme + "://" + u.Host
+	}
+	return ref, ""
 }
 
 // parseShareRef accepts a bare ULID, a "p/{id}" path, or a full URL
