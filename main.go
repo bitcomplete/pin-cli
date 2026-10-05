@@ -63,6 +63,8 @@ func main() {
 		os.Exit(runPublish(os.Args[2:]))
 	case "unpublish":
 		os.Exit(runUnpublish(os.Args[2:]))
+	case "delete":
+		os.Exit(runDelete(os.Args[2:]))
 	case "components":
 		os.Exit(runComponents(os.Args[2:]))
 	case "whoami":
@@ -90,6 +92,7 @@ Usage:
                             capability link. --ttl <dur> sets the lifetime
                             (default 7d, max 30d). Prints the public URL.
   pin unpublish <token|url> Revoke a public link before it expires.
+  pin delete <id-or-url>    Delete a share you made, every form of it.
   pin components            List MDX components, grouped by category.
   pin components get <Name> Show one component's props + example.
   pin components dump       Print every component's full detail.
@@ -700,6 +703,70 @@ func runUnpublish(args []string) int {
 	}
 	fmt.Fprintln(os.Stderr, "revoked — the public link no longer works")
 	return 0
+}
+
+// runDelete deletes a share the signed-in person made. Only its owner can:
+// the server refuses anyone else (403), and a share made before pin recorded
+// owners cannot be deleted this way.
+func runDelete(args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: pin delete <id-or-url>")
+		return 2
+	}
+	id, hostFromURL := parseShareRef(args[0])
+	if id == "" {
+		fmt.Fprintf(os.Stderr, "pin delete: not a share id or URL: %q\n", args[0])
+		return 2
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	c, err := loadCreds()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin delete: not logged in. Run `pin login`.\n")
+		return 1
+	}
+	c, err = ensureFreshAccess(ctx, c)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pin delete: refresh: %v\n", err)
+		return 1
+	}
+
+	base := hostFromURL
+	if base == "" {
+		base = host()
+	}
+	if err := deleteShare(ctx, http.DefaultClient, base, id, c.AccessToken); err != nil {
+		fmt.Fprintf(os.Stderr, "pin delete: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "deleted %s\n", id)
+	return 0
+}
+
+// deleteShare sends DELETE /api/pins/{id}; nil only on 204.
+func deleteShare(ctx context.Context, client *http.Client, base, id, accessToken string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, base+"/api/pins/"+url.PathEscape(id), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("X-Agent", agent())
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusNoContent:
+		return nil
+	case http.StatusNotFound:
+		return fmt.Errorf("not found: %s", id)
+	default:
+		rbody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(rbody)))
+	}
 }
 
 // parsePublicRef extracts the capability token from either a bare token
