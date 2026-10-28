@@ -83,7 +83,8 @@ func usage() {
 
 Usage:
   pin login [--device]      Sign in via Google. Use --device on SSH/headless.
-  pin share <file>          Upload an HTML or MDX file. Prints the share URL.
+  pin share <file>          Upload an HTML, MDX or .diff/.patch file. Prints the share URL.
+                            A diff takes --title and --desc (markdown, the PR description).
   pin get <id-or-url>       Fetch a share's MDX source to stdout. --html for
                             the rendered HTML form.
   pin publish <id-or-url>   Make a share publicly viewable (no login) via a
@@ -396,10 +397,29 @@ func runWhoami(_ []string) int {
 // ----- share -----
 
 func runShare(args []string) int {
-	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: pin share <file>")
+	// pin share <file> [--title T] [--desc D]. --title and --desc apply to a .diff/.patch: the server renders a
+	// diff with an optional banner title and a markdown PR description (X-Pin-Title, X-Pin-Description).
+	var file, title, desc string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--title" && i+1 < len(args):
+			title = args[i+1]
+			i++
+		case args[i] == "--desc" && i+1 < len(args):
+			desc = args[i+1]
+			i++
+		case file == "":
+			file = args[i]
+		default:
+			fmt.Fprintln(os.Stderr, "usage: pin share <file> [--title T] [--desc D]")
+			return 2
+		}
+	}
+	if file == "" {
+		fmt.Fprintln(os.Stderr, "usage: pin share <file> [--title T] [--desc D]")
 		return 2
 	}
+	args = []string{file}
 	body, err := os.ReadFile(args[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pin share: %v\n", err)
@@ -425,14 +445,32 @@ func runShare(args []string) int {
 	// agents can fetch via GET /p/{id}.mdx instead of paying tokens for
 	// the rendered markup.
 	contentType := "text/html; charset=utf-8"
-	if strings.HasSuffix(strings.ToLower(args[0]), ".mdx") {
+	lower := strings.ToLower(args[0])
+	isDiff := strings.HasSuffix(lower, ".diff") || strings.HasSuffix(lower, ".patch")
+	switch {
+	case strings.HasSuffix(lower, ".mdx"):
 		contentType = "text/mdx; charset=utf-8"
+	case isDiff:
+		// A patch renders as a side-by-side diff (diffview), with the PR description as markdown.
+		contentType = "text/x-diff; charset=utf-8"
+	}
+	if !isDiff && (title != "" || desc != "") {
+		fmt.Fprintln(os.Stderr, "pin share: --title and --desc apply to a .diff or .patch")
+		return 2
 	}
 
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPut, c.Issuer+"/api/pins", bytes.NewReader(body))
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 	req.Header.Set("X-Agent", agent())
+	if title != "" {
+		req.Header.Set("X-Pin-Title", title)
+	}
+	if desc != "" {
+		// Headers cannot carry newlines, so the description travels base64-encoded, which the server decodes.
+		req.Header.Set("X-Pin-Description", base64.StdEncoding.EncodeToString([]byte(desc)))
+		req.Header.Set("X-Pin-Description-Encoding", "base64")
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
